@@ -22,7 +22,15 @@ Start the browser client in another terminal:
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`, create a lobby, copy the 4 digit code, and join from another tab.
+Open `http://127.0.0.1:5173` on this computer.
+
+For another computer or phone on the same network, run `ipconfig`, find your IPv4 address, and open:
+
+```text
+http://YOUR_IPV4_ADDRESS:5173
+```
+
+The client connects back to `ws://YOUR_IPV4_ADDRESS:4000/ws`, so both ports `5173` and `4000` need to be allowed through the Windows firewall.
 
 ## Architecture
 

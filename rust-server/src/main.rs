@@ -32,7 +32,7 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .with_state(state);
 
-    let address = SocketAddr::from(([127, 0, 0, 1], 4000));
+    let address = SocketAddr::from(([0, 0, 0, 0], 4000));
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
 
     println!("server listening on ws://{address}/ws");
