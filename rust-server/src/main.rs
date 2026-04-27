@@ -13,10 +13,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 use tokio::sync::{mpsc, Mutex};
+use tower_http::services::{ServeDir, ServeFile};
 
 const MAP_HALF_SIZE: f32 = 10.0;
 const PLAYER_SPEED: f32 = 5.8;
@@ -26,21 +28,39 @@ const TICK_SECONDS: f32 = 1.0 / 30.0;
 async fn main() {
     let state = Arc::new(Mutex::new(ServerState::default()));
     spawn_simulation(state.clone());
+    let static_root = static_client_root();
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
+        .fallback_service(
+            ServeDir::new(&static_root)
+                .not_found_service(ServeFile::new(static_root.join("index.html"))),
+        )
         .with_state(state);
 
     let address = SocketAddr::from(([0, 0, 0, 0], 4000));
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
 
-    println!("server listening on ws://{address}/ws");
+    println!("Static client root: {}", static_root.display());
+    println!("Server running at http://localhost:4000");
+    println!("Listening on: {address}");
     axum::serve(listener, app).await.unwrap();
 }
 
 type SharedState = Arc<Mutex<ServerState>>;
 type Outbox = mpsc::UnboundedSender<ServerMessage>;
+
+fn static_client_root() -> PathBuf {
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root_from_repo = current_dir.join("dist");
+
+    if root_from_repo.exists() {
+        return root_from_repo;
+    }
+
+    current_dir.join("../dist")
+}
 
 #[derive(Default)]
 struct ServerState {

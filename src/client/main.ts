@@ -7,7 +7,9 @@ import './styles.css';
 
 const mapHalfSize = 10;
 const modelScale = 1.15;
-const serverUrl = `ws://${window.location.hostname || '127.0.0.1'}:4000/ws`;
+const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+const wsPort = window.location.port === '5173' ? '4000' : window.location.port || '4000';
+const serverUrl = `${wsProtocol}//${window.location.hostname || '127.0.0.1'}:${wsPort}/ws`;
 
 const modelUrls: Record<MercenaryId, string> = {
   polilock: new URL('../../models/Polilock.glb', import.meta.url).href,
