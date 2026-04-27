@@ -45,11 +45,12 @@ async fn main() {
         )
         .with_state(state);
 
-    let address = SocketAddr::from(([0, 0, 0, 0], 4000));
+    let port = server_port();
+    let address = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
 
     println!("Static client root: {}", static_root.display());
-    println!("Server running at http://localhost:4000");
+    println!("Server running at http://localhost:{port}");
     println!("Listening on: {address}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -69,6 +70,13 @@ fn static_client_root() -> PathBuf {
     }
 
     current_dir.join("../dist")
+}
+
+fn server_port() -> u16 {
+    std::env::var("PORT")
+        .ok()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(4000)
 }
 
 async fn shutdown_signal() {
