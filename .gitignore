@@ -1,0 +1,7 @@
+node_modules/
+dist/
+target/
+rust-server/target/
+.codex-logs/
+.env
+.DS_Store

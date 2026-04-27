@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Merc Movement Prototype</title>
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+
+    <section id="lobbyPanel" class="panel">
+      <div class="panelHeader">
+        <p class="eyebrow">Movement Prototype</p>
+        <h1>Merc Lobby</h1>
+      </div>
+
+      <label>
+        Name
+        <input id="nameInput" maxlength="16" value="Player" />
+      </label>
+
+      <label>
+        Mercenary
+        <select id="mercenaryInput">
+          <option value="polilock">Polilock</option>
+          <option value="welstoce">Welstoce</option>
+        </select>
+      </label>
+
+      <div class="actions">
+        <button id="createButton">Create Lobby</button>
+        <div class="joinRow">
+          <input id="codeInput" inputmode="numeric" maxlength="4" placeholder="0000" />
+          <button id="joinButton">Join</button>
+        </div>
+      </div>
+
+      <div id="lobbyInfo" class="lobbyInfo hidden">
+        <div>
+          <span>Code</span>
+          <strong id="codeLabel">0000</strong>
+        </div>
+        <button id="startButton">Start Game</button>
+      </div>
+
+      <ul id="playerList" class="playerList"></ul>
+      <p id="statusText" class="statusText">Connecting to server...</p>
+    </section>
+
+    <aside id="hud" class="hud hidden">
+      <strong id="hudCode">0000</strong>
+      <span id="hudPlayers">0 players</span>
+    </aside>
+
+    <script type="module" src="/src/client/main.ts"></script>
+  </body>
+</html>
