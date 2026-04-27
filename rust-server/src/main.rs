@@ -27,7 +27,7 @@ const MAX_HEALTH: f32 = 100.0;
 const ATTACK_RANGE: f32 = 1.7;
 const ATTACK_DAMAGE: f32 = 10.0;
 const ATTACK_SECONDS: f32 = 0.85;
-const ATTACK_WINDUP_SECONDS: f32 = 0.28;
+const ATTACK_DAMAGE_POINT_SECONDS: f32 = ATTACK_SECONDS * 0.5;
 const RESPAWN_SECONDS: f32 = 3.0;
 
 #[tokio::main]
@@ -114,8 +114,9 @@ struct Player {
     moving: bool,
     attacking: bool,
     attack_target_id: Option<String>,
+    attack_hit_target_id: Option<String>,
     attack_cooldown: f32,
-    attack_windup: f32,
+    attack_timer: f32,
     attack_damage_pending: bool,
     respawn_timer: f32,
 }
@@ -446,12 +447,12 @@ async fn set_move_target(
         return;
     }
 
-    player.target = Vec2 {
+    let move_target = Vec2 {
         x: clamp(x, -MAP_HALF_SIZE, MAP_HALF_SIZE),
         z: clamp(z, -MAP_HALF_SIZE, MAP_HALF_SIZE),
     };
-    player.moving = true;
-    cancel_attack(player);
+
+    change_move_focus(player, move_target);
     player.attack_target_id = None;
 }
 
@@ -502,11 +503,8 @@ async fn set_attack_target(
         return;
     }
 
+    change_attack_focus(player);
     player.attack_target_id = Some(target_id);
-    player.attack_windup = 0.0;
-    player.attack_damage_pending = false;
-    player.attacking = false;
-    player.moving = true;
 }
 
 async fn disconnect_player(state: &SharedState, session: &Session) {
@@ -592,8 +590,8 @@ fn tick_player(player: &mut Player, players: &HashMap<String, Player>) -> Option
 
     tick_attack_cooldown(player);
 
-    if player.attack_windup > 0.0 {
-        return tick_attack_windup(player, players);
+    if player.attack_timer > 0.0 {
+        return tick_attack_cycle(player, players);
     }
 
     player.attacking = false;
@@ -628,44 +626,50 @@ fn tick_player(player: &mut Player, players: &HashMap<String, Player>) -> Option
         return None;
     }
 
-    start_attack(player);
+    start_attack(player, target_id);
     None
 }
 
-fn tick_attack_windup(player: &mut Player, players: &HashMap<String, Player>) -> Option<DamageEvent> {
+fn tick_attack_cycle(player: &mut Player, players: &HashMap<String, Player>) -> Option<DamageEvent> {
     player.target = player.position;
     player.moving = false;
     player.attacking = true;
 
-    let Some(target_id) = player.attack_target_id.clone() else {
-        cancel_attack(player);
-        return None;
-    };
-
-    let Some(target) = players.get(&target_id) else {
-        cancel_attack(player);
-        return None;
-    };
-
-    if target.dead {
-        cancel_attack(player);
-        return None;
+    if let Some(target_id) = &player.attack_hit_target_id {
+        if let Some(target) = players.get(target_id) {
+            face_position(player, target.position);
+        }
     }
 
-    face_position(player, target.position);
-    player.attack_windup = (player.attack_windup - TICK_SECONDS).max(0.0);
+    player.attack_timer = (player.attack_timer - TICK_SECONDS).max(0.0);
+    let damage_event = attack_damage_event(player, players);
 
-    if player.attack_windup > 0.0 {
-        return None;
+    if player.attack_timer <= 0.0 {
+        finish_attack_cycle(player);
     }
 
+    damage_event
+}
+
+fn attack_damage_event(player: &mut Player, players: &HashMap<String, Player>) -> Option<DamageEvent> {
     if !player.attack_damage_pending {
         return None;
     }
 
-    player.attack_damage_pending = false;
+    if player.attack_timer > ATTACK_SECONDS - ATTACK_DAMAGE_POINT_SECONDS {
+        return None;
+    }
 
-    if distance_between(player.position, target.position) > ATTACK_RANGE {
+    player.attack_damage_pending = false;
+    let Some(target_id) = player.attack_hit_target_id.clone() else {
+        return None;
+    };
+
+    let Some(target) = players.get(&target_id) else {
+        return None;
+    };
+
+    if target.dead {
         return None;
     }
 
@@ -712,18 +716,58 @@ fn player_speed(player: &Player) -> f32 {
     POLILOCK_SPEED
 }
 
-fn start_attack(player: &mut Player) {
+fn start_attack(player: &mut Player, target_id: String) {
     player.moving = false;
     player.attacking = true;
     player.attack_cooldown = ATTACK_SECONDS;
-    player.attack_windup = ATTACK_WINDUP_SECONDS;
+    player.attack_timer = ATTACK_SECONDS;
     player.attack_damage_pending = true;
+    player.attack_hit_target_id = Some(target_id);
 }
 
 fn cancel_attack(player: &mut Player) {
     player.attacking = false;
-    player.attack_windup = 0.0;
+    player.attack_timer = 0.0;
     player.attack_damage_pending = false;
+    player.attack_hit_target_id = None;
+}
+
+fn finish_attack_cycle(player: &mut Player) {
+    player.attacking = false;
+    player.attack_timer = 0.0;
+    player.attack_damage_pending = false;
+    player.attack_hit_target_id = None;
+}
+
+fn change_move_focus(player: &mut Player, target: Vec2) {
+    if is_attack_cancelable(player) {
+        cancel_attack(player);
+    }
+
+    player.target = target;
+
+    if player.attack_timer > 0.0 {
+        return;
+    }
+
+    player.moving = true;
+}
+
+fn change_attack_focus(player: &mut Player) {
+    if is_attack_cancelable(player) {
+        cancel_attack(player);
+    }
+
+    if player.attack_timer > 0.0 {
+        return;
+    }
+
+    player.moving = true;
+    player.attacking = false;
+}
+
+fn is_attack_cancelable(player: &Player) -> bool {
+    player.attack_timer > ATTACK_SECONDS - ATTACK_DAMAGE_POINT_SECONDS
 }
 
 fn tick_attack_cooldown(player: &mut Player) {
@@ -772,7 +816,11 @@ fn clear_dead_targets(lobby: &mut Lobby) {
         };
 
         if dead_ids.contains(target_id) {
-            stop_player(player);
+            player.attack_target_id = None;
+
+            if player.attack_timer <= 0.0 {
+                stop_player(player);
+            }
         }
     }
 }
@@ -870,8 +918,9 @@ fn make_player(name: String, mercenary_id: String) -> Player {
         moving: false,
         attacking: false,
         attack_target_id: None,
+        attack_hit_target_id: None,
         attack_cooldown: 0.0,
-        attack_windup: 0.0,
+        attack_timer: 0.0,
         attack_damage_pending: false,
         respawn_timer: 0.0,
     }
