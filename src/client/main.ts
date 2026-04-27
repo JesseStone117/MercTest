@@ -29,6 +29,7 @@ type RenderPlayer = {
   healthBar: THREE.Group;
   healthFill: THREE.Mesh;
   health: number;
+  dead: boolean;
   moving: boolean;
   attacking: boolean;
   attackTargetId: string | null;
@@ -260,7 +261,7 @@ function updatePointerRay(event: PointerEvent): void {
 
 function enemyIdFromRay(): string | null {
   const enemies = [...players.values()]
-    .filter((player) => player.id !== lobby.playerId && player.health > 0)
+    .filter((player) => player.id !== lobby.playerId && !player.dead)
     .map((player) => player.group);
 
   const hits = raycaster.intersectObjects(enemies, true);
@@ -379,12 +380,20 @@ function updateRenderPlayer(player: PlayerState): void {
     return;
   }
 
+  const wasDead = renderPlayer.dead;
   renderPlayer.serverPosition.set(player.x, 0, player.z);
   renderPlayer.group.rotation.y = player.facing;
   renderPlayer.health = player.health;
+  renderPlayer.dead = player.dead;
   renderPlayer.moving = player.moving;
   renderPlayer.attacking = player.attacking;
   renderPlayer.attackTargetId = player.attackTargetId;
+
+  if (wasDead && !player.dead) {
+    renderPlayer.visualPosition.copy(renderPlayer.serverPosition);
+    renderPlayer.group.position.copy(renderPlayer.serverPosition);
+  }
+
   updateHealthBar(renderPlayer);
   setPlayerAnimation(renderPlayer);
 }
@@ -435,6 +444,7 @@ function loadRenderPlayer(player: PlayerState): void {
         healthBar,
         healthFill,
         health: player.health,
+        dead: player.dead,
         moving: player.moving,
         attacking: player.attacking,
         attackTargetId: player.attackTargetId
@@ -465,10 +475,17 @@ async function loadModel(mercenaryId: MercenaryId): Promise<GLTF> {
 
 function setPlayerAnimation(player: RenderPlayer): void {
   const localAnimationState = { mercenaryId: player.mercenaryId };
+  const deathAnim = getAnimationName(localAnimationState.mercenaryId, 'death');
   const attackAnim = getAnimationName(localAnimationState.mercenaryId, 'attack');
   const walkAnim = getAnimationName(localAnimationState.mercenaryId, 'walk');
   const idleAnim = getAnimationName(localAnimationState.mercenaryId, 'idle');
-  const nextActionName = player.attacking ? attackAnim : player.moving ? walkAnim : idleAnim;
+  const nextActionName = player.dead
+    ? deathAnim
+    : player.attacking
+      ? attackAnim
+      : player.moving
+        ? walkAnim
+        : idleAnim;
 
   if (player.currentActionName === nextActionName) {
     return;
@@ -481,7 +498,17 @@ function setPlayerAnimation(player: RenderPlayer): void {
   }
 
   const previousAction = player.actions.get(player.currentActionName);
-  nextAction.reset().fadeIn(0.12).play();
+  nextAction.reset();
+
+  if (nextActionName === deathAnim) {
+    nextAction.setLoop(THREE.LoopOnce, 1);
+    nextAction.clampWhenFinished = true;
+  } else {
+    nextAction.setLoop(THREE.LoopRepeat, Infinity);
+    nextAction.clampWhenFinished = false;
+  }
+
+  nextAction.fadeIn(0.12).play();
 
   if (previousAction) {
     previousAction.fadeOut(0.12);
@@ -544,7 +571,7 @@ function updateTargetMarker(): void {
 
   const target = players.get(targetId);
 
-  if (!target || target.health <= 0) {
+  if (!target || target.dead) {
     hideTargetMarker();
     return;
   }
@@ -593,6 +620,7 @@ function makeHealthFill(): THREE.Mesh {
 
 function updateHealthBar(player: RenderPlayer): void {
   const healthPercent = clamp(player.health / maxHealth, 0, 1);
+  player.healthBar.visible = !player.dead;
   player.healthFill.scale.x = healthPercent;
   player.healthFill.position.x = -0.59 * (1 - healthPercent);
 }

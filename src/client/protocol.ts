@@ -63,6 +63,7 @@ export type PlayerState = {
   z: number;
   facing: number;
   health: number;
+  dead: boolean;
   moving: boolean;
   attacking: boolean;
   attackTargetId: string | null;

@@ -21,12 +21,14 @@ use tokio::sync::{mpsc, Mutex};
 use tower_http::services::{ServeDir, ServeFile};
 
 const MAP_HALF_SIZE: f32 = 10.0;
-const PLAYER_SPEED: f32 = 5.8;
+const POLILOCK_SPEED: f32 = 5.8;
 const TICK_SECONDS: f32 = 1.0 / 30.0;
 const MAX_HEALTH: f32 = 100.0;
 const ATTACK_RANGE: f32 = 1.7;
 const ATTACK_DAMAGE: f32 = 10.0;
 const ATTACK_SECONDS: f32 = 0.85;
+const ATTACK_WINDUP_SECONDS: f32 = 0.28;
+const RESPAWN_SECONDS: f32 = 3.0;
 
 #[tokio::main]
 async fn main() {
@@ -96,13 +98,18 @@ struct Player {
     name: String,
     mercenary_id: String,
     position: Vec2,
+    spawn: Vec2,
     target: Vec2,
     facing: f32,
     health: f32,
+    dead: bool,
     moving: bool,
     attacking: bool,
     attack_target_id: Option<String>,
     attack_cooldown: f32,
+    attack_windup: f32,
+    attack_damage_pending: bool,
+    respawn_timer: f32,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -177,6 +184,7 @@ struct PlayerView {
     z: f32,
     facing: f32,
     health: f32,
+    dead: bool,
     moving: bool,
     attacking: bool,
     #[serde(rename = "attackTargetId")]
@@ -425,12 +433,17 @@ async fn set_move_target(
         return;
     };
 
+    if player.dead {
+        send_error(tx, "You cannot move while defeated.");
+        return;
+    }
+
     player.target = Vec2 {
         x: clamp(x, -MAP_HALF_SIZE, MAP_HALF_SIZE),
         z: clamp(z, -MAP_HALF_SIZE, MAP_HALF_SIZE),
     };
     player.moving = true;
-    player.attacking = false;
+    cancel_attack(player);
     player.attack_target_id = None;
 }
 
@@ -462,7 +475,7 @@ async fn set_attack_target(
     }
 
     let target_is_valid = match lobby.players.get(&target_id) {
-        Some(target) => target.health > 0.0,
+        Some(target) => !target.dead,
         None => false,
     };
 
@@ -476,13 +489,14 @@ async fn set_attack_target(
         return;
     };
 
-    if player.health <= 0.0 {
+    if player.dead {
         send_error(tx, "You cannot attack while defeated.");
         return;
     }
 
     player.attack_target_id = Some(target_id);
-    player.attack_cooldown = 0.0;
+    player.attack_windup = 0.0;
+    player.attack_damage_pending = false;
     player.attacking = false;
     player.moving = true;
 }
@@ -563,13 +577,18 @@ async fn tick_lobbies(state: &SharedState) -> Vec<(Outbox, ServerMessage)> {
 }
 
 fn tick_player(player: &mut Player, players: &HashMap<String, Player>) -> Option<DamageEvent> {
-    player.attacking = false;
-    tick_attack_cooldown(player);
-
-    if player.health <= 0.0 {
-        stop_player(player);
+    if player.dead {
+        tick_respawn(player);
         return None;
     }
+
+    tick_attack_cooldown(player);
+
+    if player.attack_windup > 0.0 {
+        return tick_attack_windup(player, players);
+    }
+
+    player.attacking = false;
 
     let Some(target_id) = player.attack_target_id.clone() else {
         player.moving = move_player_toward(player, player.target, 0.02);
@@ -581,7 +600,7 @@ fn tick_player(player: &mut Player, players: &HashMap<String, Player>) -> Option
         return None;
     };
 
-    if target.health <= 0.0 {
+    if target.dead {
         stop_player(player);
         return None;
     }
@@ -596,13 +615,51 @@ fn tick_player(player: &mut Player, players: &HashMap<String, Player>) -> Option
 
     player.target = player.position;
     player.moving = false;
-    player.attacking = true;
 
     if player.attack_cooldown > 0.0 {
         return None;
     }
 
-    player.attack_cooldown = ATTACK_SECONDS;
+    start_attack(player);
+    None
+}
+
+fn tick_attack_windup(player: &mut Player, players: &HashMap<String, Player>) -> Option<DamageEvent> {
+    player.target = player.position;
+    player.moving = false;
+    player.attacking = true;
+
+    let Some(target_id) = player.attack_target_id.clone() else {
+        cancel_attack(player);
+        return None;
+    };
+
+    let Some(target) = players.get(&target_id) else {
+        cancel_attack(player);
+        return None;
+    };
+
+    if target.dead {
+        cancel_attack(player);
+        return None;
+    }
+
+    face_position(player, target.position);
+    player.attack_windup = (player.attack_windup - TICK_SECONDS).max(0.0);
+
+    if player.attack_windup > 0.0 {
+        return None;
+    }
+
+    if !player.attack_damage_pending {
+        return None;
+    }
+
+    player.attack_damage_pending = false;
+
+    if distance_between(player.position, target.position) > ATTACK_RANGE {
+        return None;
+    }
 
     Some(DamageEvent {
         target_id,
@@ -624,7 +681,7 @@ fn move_player_toward(player: &mut Player, target: Vec2, stop_distance: f32) -> 
     }
 
     player.facing = dx.atan2(dz);
-    let step = PLAYER_SPEED * TICK_SECONDS;
+    let step = player_speed(player) * TICK_SECONDS;
     let remaining_distance = distance - stop_distance;
 
     if remaining_distance <= step {
@@ -637,6 +694,28 @@ fn move_player_toward(player: &mut Player, target: Vec2, stop_distance: f32) -> 
     player.position.z += (dz / distance) * step;
 
     true
+}
+
+fn player_speed(player: &Player) -> f32 {
+    if player.mercenary_id == "welstoce" {
+        return POLILOCK_SPEED * 1.1;
+    }
+
+    POLILOCK_SPEED
+}
+
+fn start_attack(player: &mut Player) {
+    player.moving = false;
+    player.attacking = true;
+    player.attack_cooldown = ATTACK_SECONDS;
+    player.attack_windup = ATTACK_WINDUP_SECONDS;
+    player.attack_damage_pending = true;
+}
+
+fn cancel_attack(player: &mut Player) {
+    player.attacking = false;
+    player.attack_windup = 0.0;
+    player.attack_damage_pending = false;
 }
 
 fn tick_attack_cooldown(player: &mut Player) {
@@ -653,17 +732,17 @@ fn apply_damage(lobby: &mut Lobby, damage_events: Vec<DamageEvent>) {
             continue;
         };
 
-        if target.health <= 0.0 {
+        if target.dead {
             continue;
         }
 
         target.health = (target.health - damage_event.amount).max(0.0);
 
-        if target.health > 0.0 {
+        if target.health >= 1.0 {
             continue;
         }
 
-        stop_player(target);
+        kill_player(target);
     }
 }
 
@@ -671,7 +750,7 @@ fn clear_dead_targets(lobby: &mut Lobby) {
     let dead_ids: Vec<String> = lobby
         .players
         .values()
-        .filter(|player| player.health <= 0.0)
+        .filter(|player| player.dead)
         .map(|player| player.id.clone())
         .collect();
 
@@ -693,8 +772,37 @@ fn clear_dead_targets(lobby: &mut Lobby) {
 fn stop_player(player: &mut Player) {
     player.target = player.position;
     player.moving = false;
-    player.attacking = false;
+    cancel_attack(player);
     player.attack_target_id = None;
+}
+
+fn kill_player(player: &mut Player) {
+    stop_player(player);
+    player.health = 0.0;
+    player.dead = true;
+    player.respawn_timer = RESPAWN_SECONDS;
+}
+
+fn tick_respawn(player: &mut Player) {
+    player.respawn_timer = (player.respawn_timer - TICK_SECONDS).max(0.0);
+
+    if player.respawn_timer > 0.0 {
+        return;
+    }
+
+    respawn_player(player);
+}
+
+fn respawn_player(player: &mut Player) {
+    player.position = player.spawn;
+    player.target = player.spawn;
+    player.health = MAX_HEALTH;
+    player.dead = false;
+    player.moving = false;
+    player.attack_target_id = None;
+    player.attack_cooldown = 0.0;
+    player.respawn_timer = 0.0;
+    cancel_attack(player);
 }
 
 fn face_position(player: &mut Player, target: Vec2) {
@@ -727,13 +835,16 @@ fn spawn_players(lobby: &mut Lobby) {
     for (index, player) in lobby.players.values_mut().enumerate() {
         let spawn = spawns[index % spawns.len()];
         player.position = spawn;
+        player.spawn = spawn;
         player.target = spawn;
         player.facing = 0.0;
         player.health = MAX_HEALTH;
+        player.dead = false;
         player.moving = false;
-        player.attacking = false;
         player.attack_target_id = None;
         player.attack_cooldown = 0.0;
+        player.respawn_timer = 0.0;
+        cancel_attack(player);
     }
 }
 
@@ -743,13 +854,18 @@ fn make_player(name: String, mercenary_id: String) -> Player {
         name: clean_name(name),
         mercenary_id: clean_mercenary_id(mercenary_id),
         position: Vec2 { x: 0.0, z: 0.0 },
+        spawn: Vec2 { x: 0.0, z: 0.0 },
         target: Vec2 { x: 0.0, z: 0.0 },
         facing: 0.0,
         health: MAX_HEALTH,
+        dead: false,
         moving: false,
         attacking: false,
         attack_target_id: None,
         attack_cooldown: 0.0,
+        attack_windup: 0.0,
+        attack_damage_pending: false,
+        respawn_timer: 0.0,
     }
 }
 
@@ -801,6 +917,7 @@ fn player_views(lobby: &Lobby) -> Vec<PlayerView> {
             z: player.position.z,
             facing: player.facing,
             health: player.health,
+            dead: player.dead,
             moving: player.moving,
             attacking: player.attacking,
             attack_target_id: player.attack_target_id.clone(),
