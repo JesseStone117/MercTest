@@ -631,7 +631,6 @@ fn tick_player(player: &mut Player, players: &HashMap<String, Player>) -> Option
 }
 
 fn tick_attack_cycle(player: &mut Player, players: &HashMap<String, Player>) -> Option<DamageEvent> {
-    player.target = player.position;
     player.moving = false;
     player.attacking = true;
 
@@ -642,10 +641,19 @@ fn tick_attack_cycle(player: &mut Player, players: &HashMap<String, Player>) -> 
     }
 
     player.attack_timer = (player.attack_timer - TICK_SECONDS).max(0.0);
+    let reached_damage_point =
+        player.attack_damage_pending && player.attack_timer <= ATTACK_SECONDS - ATTACK_DAMAGE_POINT_SECONDS;
     let damage_event = attack_damage_event(player, players);
+
+    if reached_damage_point {
+        finish_attack_cycle(player);
+        resume_focus_after_attack(player, players);
+        return damage_event;
+    }
 
     if player.attack_timer <= 0.0 {
         finish_attack_cycle(player);
+        resume_focus_after_attack(player, players);
     }
 
     damage_event
@@ -717,6 +725,7 @@ fn player_speed(player: &Player) -> f32 {
 }
 
 fn start_attack(player: &mut Player, target_id: String) {
+    player.target = player.position;
     player.moving = false;
     player.attacking = true;
     player.attack_cooldown = ATTACK_SECONDS;
@@ -768,6 +777,33 @@ fn change_attack_focus(player: &mut Player) {
 
 fn is_attack_cancelable(player: &Player) -> bool {
     player.attack_timer > ATTACK_SECONDS - ATTACK_DAMAGE_POINT_SECONDS
+}
+
+fn resume_focus_after_attack(player: &mut Player, players: &HashMap<String, Player>) {
+    let Some(target_id) = player.attack_target_id.clone() else {
+        player.moving = move_player_toward(player, player.target, 0.02);
+        return;
+    };
+
+    let Some(target) = players.get(&target_id) else {
+        stop_player(player);
+        return;
+    };
+
+    if target.dead {
+        stop_player(player);
+        return;
+    }
+
+    face_position(player, target.position);
+
+    if distance_between(player.position, target.position) > ATTACK_RANGE {
+        player.moving = move_player_toward(player, target.position, ATTACK_RANGE * 0.9);
+        return;
+    }
+
+    player.target = player.position;
+    player.moving = false;
 }
 
 fn tick_attack_cooldown(player: &mut Player) {
