@@ -7,6 +7,7 @@ import './styles.css';
 
 const mapHalfSize = 10;
 const modelScale = 1.15;
+const maxHealth = 100;
 const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsPort = window.location.port === '5173' ? '4000' : window.location.port || '4000';
 const serverUrl = `${wsProtocol}//${window.location.hostname || '127.0.0.1'}:${wsPort}/ws`;
@@ -25,7 +26,12 @@ type RenderPlayer = {
   currentActionName: string;
   visualPosition: THREE.Vector3;
   serverPosition: THREE.Vector3;
+  healthBar: THREE.Group;
+  healthFill: THREE.Mesh;
+  health: number;
   moving: boolean;
+  attacking: boolean;
+  attackTargetId: string | null;
 };
 
 type LobbyState = {
@@ -91,6 +97,7 @@ const modelCache = new Map<MercenaryId, GLTF>();
 
 let socket: WebSocket | null = null;
 let moveMarker: THREE.Mesh | null = null;
+let targetMarker: THREE.Mesh | null = null;
 
 setupWorld();
 connect();
@@ -221,7 +228,17 @@ function handlePointerDown(event: PointerEvent): void {
     return;
   }
 
-  const point = worldPointFromPointer(event);
+  updatePointerRay(event);
+
+  const enemyId = enemyIdFromRay();
+
+  if (enemyId) {
+    send({ type: 'target_enemy', playerId: enemyId });
+    hideMoveMarker();
+    return;
+  }
+
+  const point = worldPointFromRay();
 
   if (!point) {
     return;
@@ -234,12 +251,44 @@ function handlePointerDown(event: PointerEvent): void {
   showMoveMarker(x, z);
 }
 
-function worldPointFromPointer(event: PointerEvent): THREE.Vector3 | null {
+function updatePointerRay(event: PointerEvent): void {
   const rect = canvas.getBoundingClientRect();
   pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
   raycaster.setFromCamera(pointer, camera);
+}
 
+function enemyIdFromRay(): string | null {
+  const enemies = [...players.values()]
+    .filter((player) => player.id !== lobby.playerId && player.health > 0)
+    .map((player) => player.group);
+
+  const hits = raycaster.intersectObjects(enemies, true);
+
+  if (hits.length === 0) {
+    return null;
+  }
+
+  return playerIdFromObject(hits[0].object);
+}
+
+function playerIdFromObject(object: THREE.Object3D): string | null {
+  let current: THREE.Object3D | null = object;
+
+  while (current) {
+    const playerId = current.userData.playerId;
+
+    if (typeof playerId === 'string') {
+      return playerId;
+    }
+
+    current = current.parent;
+  }
+
+  return null;
+}
+
+function worldPointFromRay(): THREE.Vector3 | null {
   const point = new THREE.Vector3();
   const didHit = raycaster.ray.intersectPlane(groundPlane, point);
 
@@ -315,8 +364,11 @@ function syncPlayers(serverPlayers: PlayerState[]): void {
     }
 
     scene.remove(player.group);
+    scene.remove(player.healthBar);
     players.delete(id);
   }
+
+  updateTargetMarker();
 }
 
 function updateRenderPlayer(player: PlayerState): void {
@@ -329,7 +381,11 @@ function updateRenderPlayer(player: PlayerState): void {
 
   renderPlayer.serverPosition.set(player.x, 0, player.z);
   renderPlayer.group.rotation.y = player.facing;
+  renderPlayer.health = player.health;
   renderPlayer.moving = player.moving;
+  renderPlayer.attacking = player.attacking;
+  renderPlayer.attackTargetId = player.attackTargetId;
+  updateHealthBar(renderPlayer);
   setPlayerAnimation(renderPlayer);
 }
 
@@ -353,12 +409,19 @@ function loadRenderPlayer(player: PlayerState): void {
       group.scale.setScalar(modelScale);
       group.position.set(player.x, 0, player.z);
       group.rotation.y = player.facing;
+      group.userData.playerId = player.id;
       group.traverse((child: THREE.Object3D) => {
+        child.userData.playerId = player.id;
+
         if (child instanceof THREE.Mesh) {
           child.castShadow = true;
           child.receiveShadow = true;
         }
       });
+
+      const healthBar = makeHealthBar();
+      const healthFill = makeHealthFill();
+      healthBar.add(healthFill);
 
       const renderPlayer: RenderPlayer = {
         id: player.id,
@@ -369,11 +432,18 @@ function loadRenderPlayer(player: PlayerState): void {
         currentActionName: '',
         visualPosition: group.position.clone(),
         serverPosition: new THREE.Vector3(player.x, 0, player.z),
-        moving: player.moving
+        healthBar,
+        healthFill,
+        health: player.health,
+        moving: player.moving,
+        attacking: player.attacking,
+        attackTargetId: player.attackTargetId
       };
 
       players.set(player.id, renderPlayer);
       scene.add(group);
+      scene.add(healthBar);
+      updateHealthBar(renderPlayer);
       setPlayerAnimation(renderPlayer);
     })
     .finally(() => {
@@ -395,9 +465,10 @@ async function loadModel(mercenaryId: MercenaryId): Promise<GLTF> {
 
 function setPlayerAnimation(player: RenderPlayer): void {
   const localAnimationState = { mercenaryId: player.mercenaryId };
+  const attackAnim = getAnimationName(localAnimationState.mercenaryId, 'attack');
   const walkAnim = getAnimationName(localAnimationState.mercenaryId, 'walk');
   const idleAnim = getAnimationName(localAnimationState.mercenaryId, 'idle');
-  const nextActionName = player.moving ? walkAnim : idleAnim;
+  const nextActionName = player.attacking ? attackAnim : player.moving ? walkAnim : idleAnim;
 
   if (player.currentActionName === nextActionName) {
     return;
@@ -426,9 +497,16 @@ function animate(): void {
   for (const player of players.values()) {
     player.visualPosition.lerp(player.serverPosition, followAmount);
     player.group.position.copy(player.visualPosition);
+    player.healthBar.position.set(
+      player.visualPosition.x,
+      player.visualPosition.y + 2.45,
+      player.visualPosition.z
+    );
+    player.healthBar.quaternion.copy(camera.quaternion);
     player.mixer.update(delta);
   }
 
+  updateTargetMarker();
   renderer.render(scene, camera);
   requestAnimationFrame(animate);
 }
@@ -444,6 +522,79 @@ function showMoveMarker(x: number, z: number): void {
   }
 
   moveMarker.position.set(x, 0.04, z);
+  moveMarker.visible = true;
+}
+
+function hideMoveMarker(): void {
+  if (!moveMarker) {
+    return;
+  }
+
+  moveMarker.visible = false;
+}
+
+function updateTargetMarker(): void {
+  const localPlayer = lobby.players.find((player) => player.id === lobby.playerId);
+  const targetId = localPlayer?.attackTargetId;
+
+  if (!targetId) {
+    hideTargetMarker();
+    return;
+  }
+
+  const target = players.get(targetId);
+
+  if (!target || target.health <= 0) {
+    hideTargetMarker();
+    return;
+  }
+
+  if (!targetMarker) {
+    targetMarker = new THREE.Mesh(
+      new THREE.RingGeometry(0.55, 0.66, 36),
+      new THREE.MeshBasicMaterial({ color: 0xe0524d, side: THREE.DoubleSide })
+    );
+    targetMarker.rotation.x = -Math.PI / 2;
+    scene.add(targetMarker);
+  }
+
+  targetMarker.position.set(target.visualPosition.x, 0.05, target.visualPosition.z);
+  targetMarker.visible = true;
+}
+
+function hideTargetMarker(): void {
+  if (!targetMarker) {
+    return;
+  }
+
+  targetMarker.visible = false;
+}
+
+function makeHealthBar(): THREE.Group {
+  const group = new THREE.Group();
+  const background = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.25, 0.14),
+    new THREE.MeshBasicMaterial({ color: 0x251f1f })
+  );
+
+  group.add(background);
+  return group;
+}
+
+function makeHealthFill(): THREE.Mesh {
+  const fill = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.18, 0.08),
+    new THREE.MeshBasicMaterial({ color: 0x6de084 })
+  );
+
+  fill.position.z = 0.01;
+  return fill;
+}
+
+function updateHealthBar(player: RenderPlayer): void {
+  const healthPercent = clamp(player.health / maxHealth, 0, 1);
+  player.healthFill.scale.x = healthPercent;
+  player.healthFill.position.x = -0.59 * (1 - healthPercent);
 }
 
 function resize(): void {

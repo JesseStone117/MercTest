@@ -19,6 +19,10 @@ export type ClientMessage =
       type: 'move_to';
       x: number;
       z: number;
+    }
+  | {
+      type: 'target_enemy';
+      playerId: string;
     };
 
 export type ServerMessage =
@@ -58,5 +62,8 @@ export type PlayerState = {
   x: number;
   z: number;
   facing: number;
+  health: number;
   moving: boolean;
+  attacking: boolean;
+  attackTargetId: string | null;
 };

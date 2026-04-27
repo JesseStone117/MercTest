@@ -23,6 +23,10 @@ use tower_http::services::{ServeDir, ServeFile};
 const MAP_HALF_SIZE: f32 = 10.0;
 const PLAYER_SPEED: f32 = 5.8;
 const TICK_SECONDS: f32 = 1.0 / 30.0;
+const MAX_HEALTH: f32 = 100.0;
+const ATTACK_RANGE: f32 = 1.7;
+const ATTACK_DAMAGE: f32 = 10.0;
+const ATTACK_SECONDS: f32 = 0.85;
 
 #[tokio::main]
 async fn main() {
@@ -45,7 +49,10 @@ async fn main() {
     println!("Static client root: {}", static_root.display());
     println!("Server running at http://localhost:4000");
     println!("Listening on: {address}");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
 }
 
 type SharedState = Arc<Mutex<ServerState>>;
@@ -60,6 +67,14 @@ fn static_client_root() -> PathBuf {
     }
 
     current_dir.join("../dist")
+}
+
+async fn shutdown_signal() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        return;
+    }
+
+    println!("Stopping server...");
 }
 
 #[derive(Default)]
@@ -83,7 +98,11 @@ struct Player {
     position: Vec2,
     target: Vec2,
     facing: f32,
+    health: f32,
     moving: bool,
+    attacking: bool,
+    attack_target_id: Option<String>,
+    attack_cooldown: f32,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -110,6 +129,10 @@ enum ClientMessage {
     MoveTo {
         x: f32,
         z: f32,
+    },
+    TargetEnemy {
+        #[serde(rename = "playerId")]
+        player_id: String,
     },
 }
 
@@ -153,12 +176,21 @@ struct PlayerView {
     x: f32,
     z: f32,
     facing: f32,
+    health: f32,
     moving: bool,
+    attacking: bool,
+    #[serde(rename = "attackTargetId")]
+    attack_target_id: Option<String>,
 }
 
 struct Session {
     lobby_code: String,
     player_id: String,
+}
+
+struct DamageEvent {
+    target_id: String,
+    amount: f32,
 }
 
 async fn ws_handler(upgrade: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {
@@ -225,6 +257,9 @@ async fn handle_client_message(
         }
         ClientMessage::MoveTo { x, z } => {
             set_move_target(state, session, tx, x, z).await;
+        }
+        ClientMessage::TargetEnemy { player_id } => {
+            set_attack_target(state, session, tx, player_id).await;
         }
     }
 }
@@ -395,6 +430,61 @@ async fn set_move_target(
         z: clamp(z, -MAP_HALF_SIZE, MAP_HALF_SIZE),
     };
     player.moving = true;
+    player.attacking = false;
+    player.attack_target_id = None;
+}
+
+async fn set_attack_target(
+    state: &SharedState,
+    session: &Option<Session>,
+    tx: &Outbox,
+    target_id: String,
+) {
+    let Some(session) = session else {
+        send_error(tx, "Create or join a lobby first.");
+        return;
+    };
+
+    let mut state = state.lock().await;
+    let Some(lobby) = state.lobbies.get_mut(&session.lobby_code) else {
+        send_error(tx, "Lobby no longer exists.");
+        return;
+    };
+
+    if !lobby.started {
+        send_error(tx, "The game has not started yet.");
+        return;
+    }
+
+    if target_id == session.player_id {
+        send_error(tx, "You cannot target yourself.");
+        return;
+    }
+
+    let target_is_valid = match lobby.players.get(&target_id) {
+        Some(target) => target.health > 0.0,
+        None => false,
+    };
+
+    if !target_is_valid {
+        send_error(tx, "Target not found.");
+        return;
+    }
+
+    let Some(player) = lobby.players.get_mut(&session.player_id) else {
+        send_error(tx, "Player not found.");
+        return;
+    };
+
+    if player.health <= 0.0 {
+        send_error(tx, "You cannot attack while defeated.");
+        return;
+    }
+
+    player.attack_target_id = Some(target_id);
+    player.attack_cooldown = 0.0;
+    player.attacking = false;
+    player.moving = true;
 }
 
 async fn disconnect_player(state: &SharedState, session: &Session) {
@@ -447,9 +537,17 @@ async fn tick_lobbies(state: &SharedState) -> Vec<(Outbox, ServerMessage)> {
             continue;
         }
 
+        let snapshot = lobby.players.clone();
+        let mut damage_events = Vec::new();
+
         for player in lobby.players.values_mut() {
-            move_player(player);
+            if let Some(damage_event) = tick_player(player, &snapshot) {
+                damage_events.push(damage_event);
+            }
         }
+
+        apply_damage(lobby, damage_events);
+        clear_dead_targets(lobby);
 
         let message = ServerMessage::State {
             tick,
@@ -464,33 +562,157 @@ async fn tick_lobbies(state: &SharedState) -> Vec<(Outbox, ServerMessage)> {
     outgoing_messages
 }
 
-fn move_player(player: &mut Player) {
-    if !player.moving {
-        return;
+fn tick_player(player: &mut Player, players: &HashMap<String, Player>) -> Option<DamageEvent> {
+    player.attacking = false;
+    tick_attack_cooldown(player);
+
+    if player.health <= 0.0 {
+        stop_player(player);
+        return None;
     }
 
-    let dx = player.target.x - player.position.x;
-    let dz = player.target.z - player.position.z;
+    let Some(target_id) = player.attack_target_id.clone() else {
+        player.moving = move_player_toward(player, player.target, 0.02);
+        return None;
+    };
+
+    let Some(target) = players.get(&target_id) else {
+        stop_player(player);
+        return None;
+    };
+
+    if target.health <= 0.0 {
+        stop_player(player);
+        return None;
+    }
+
+    face_position(player, target.position);
+    let distance = distance_between(player.position, target.position);
+
+    if distance > ATTACK_RANGE {
+        player.moving = move_player_toward(player, target.position, ATTACK_RANGE * 0.9);
+        return None;
+    }
+
+    player.target = player.position;
+    player.moving = false;
+    player.attacking = true;
+
+    if player.attack_cooldown > 0.0 {
+        return None;
+    }
+
+    player.attack_cooldown = ATTACK_SECONDS;
+
+    Some(DamageEvent {
+        target_id,
+        amount: ATTACK_DAMAGE,
+    })
+}
+
+fn move_player_toward(player: &mut Player, target: Vec2, stop_distance: f32) -> bool {
+    let dx = target.x - player.position.x;
+    let dz = target.z - player.position.z;
     let distance = (dx * dx + dz * dz).sqrt();
 
-    if distance <= 0.02 {
-        player.position = player.target;
-        player.moving = false;
-        return;
+    if distance <= stop_distance {
+        if stop_distance <= 0.02 {
+            player.position = target;
+        }
+
+        return false;
     }
 
     player.facing = dx.atan2(dz);
-
     let step = PLAYER_SPEED * TICK_SECONDS;
+    let remaining_distance = distance - stop_distance;
 
-    if distance <= step {
-        player.position = player.target;
-        player.moving = false;
-        return;
+    if remaining_distance <= step {
+        player.position.x += (dx / distance) * remaining_distance;
+        player.position.z += (dz / distance) * remaining_distance;
+        return false;
     }
 
     player.position.x += (dx / distance) * step;
     player.position.z += (dz / distance) * step;
+
+    true
+}
+
+fn tick_attack_cooldown(player: &mut Player) {
+    if player.attack_cooldown <= 0.0 {
+        return;
+    }
+
+    player.attack_cooldown = (player.attack_cooldown - TICK_SECONDS).max(0.0);
+}
+
+fn apply_damage(lobby: &mut Lobby, damage_events: Vec<DamageEvent>) {
+    for damage_event in damage_events {
+        let Some(target) = lobby.players.get_mut(&damage_event.target_id) else {
+            continue;
+        };
+
+        if target.health <= 0.0 {
+            continue;
+        }
+
+        target.health = (target.health - damage_event.amount).max(0.0);
+
+        if target.health > 0.0 {
+            continue;
+        }
+
+        stop_player(target);
+    }
+}
+
+fn clear_dead_targets(lobby: &mut Lobby) {
+    let dead_ids: Vec<String> = lobby
+        .players
+        .values()
+        .filter(|player| player.health <= 0.0)
+        .map(|player| player.id.clone())
+        .collect();
+
+    if dead_ids.is_empty() {
+        return;
+    }
+
+    for player in lobby.players.values_mut() {
+        let Some(target_id) = &player.attack_target_id else {
+            continue;
+        };
+
+        if dead_ids.contains(target_id) {
+            stop_player(player);
+        }
+    }
+}
+
+fn stop_player(player: &mut Player) {
+    player.target = player.position;
+    player.moving = false;
+    player.attacking = false;
+    player.attack_target_id = None;
+}
+
+fn face_position(player: &mut Player, target: Vec2) {
+    let dx = target.x - player.position.x;
+    let dz = target.z - player.position.z;
+
+    if dx.abs() < 0.001 && dz.abs() < 0.001 {
+        return;
+    }
+
+    player.facing = dx.atan2(dz);
+}
+
+fn distance_between(a: Vec2, b: Vec2) -> f32 {
+    let dx = b.x - a.x;
+    let dz = b.z - a.z;
+
+    (dx * dx + dz * dz).sqrt()
 }
 
 fn spawn_players(lobby: &mut Lobby) {
@@ -507,7 +729,11 @@ fn spawn_players(lobby: &mut Lobby) {
         player.position = spawn;
         player.target = spawn;
         player.facing = 0.0;
+        player.health = MAX_HEALTH;
         player.moving = false;
+        player.attacking = false;
+        player.attack_target_id = None;
+        player.attack_cooldown = 0.0;
     }
 }
 
@@ -519,7 +745,11 @@ fn make_player(name: String, mercenary_id: String) -> Player {
         position: Vec2 { x: 0.0, z: 0.0 },
         target: Vec2 { x: 0.0, z: 0.0 },
         facing: 0.0,
+        health: MAX_HEALTH,
         moving: false,
+        attacking: false,
+        attack_target_id: None,
+        attack_cooldown: 0.0,
     }
 }
 
@@ -570,7 +800,10 @@ fn player_views(lobby: &Lobby) -> Vec<PlayerView> {
             x: player.position.x,
             z: player.position.z,
             facing: player.facing,
+            health: player.health,
             moving: player.moving,
+            attacking: player.attacking,
+            attack_target_id: player.attack_target_id.clone(),
         })
         .collect();
 
